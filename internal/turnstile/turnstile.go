@@ -73,6 +73,13 @@ type nativeBoundMethod struct {
 	bound  string // bound this.toString()
 }
 
+// closureFunc 表示 opcode 30 创建的闭包函数
+type closureFunc struct {
+	paramSlots []int      // 形参槽位（参数化闭包时非空）
+	bodySlots  []int      // body 来源槽位
+	body       []tokenItem // 展开后的 opcode 列表
+}
+
 // engine 是 turnstile VM 的运行状态
 type engine struct {
 	slots      map[int]any
@@ -250,21 +257,16 @@ func (e *engine) dispatch(item tokenItem) {
 			e.slots[n] = toString(cur) + toString(inc)
 		}
 
-	case opHt: // 6 — slot[n] = toStr(slot[m])[toStr(slot[r])]
+	case opHt: // 6 — slot[n] = slot[m][slot[r]]（真实属性访问）
 		if len(item.args) < 3 {
 			return
 		}
 		n := toInt(item.args[0])
 		m := toInt(item.args[1])
 		r := toInt(item.args[2])
-		parent := toString(e.slots[m])
-		child := toString(e.slots[r])
-		prop := parent + "." + child
-		if prop == "window.document.location" {
-			e.slots[n] = "https://chatgpt.com/"
-		} else {
-			e.slots[n] = prop
-		}
+		parent := e.slots[m]
+		childKey := toString(e.slots[r])
+		e.slots[n] = resolveProperty(parent, childKey)
 
 	case opZt7: // 7 — 通用调用 slot[n](...args.map(toString))
 		if len(item.args) < 1 {
@@ -311,7 +313,22 @@ func (e *engine) dispatch(item tokenItem) {
 		}
 		e.slots[toInt(item.args[0])] = "self"
 
-	case opnn: // 13 — (reserved)
+	case opnn: // 13 — try { slot[e](...r) } catch { slot[n] = ""+err }
+		if len(item.args) < 2 {
+			return
+		}
+		n := toInt(item.args[0])
+		eSlot := toInt(item.args[1])
+		fn := e.slots[eSlot]
+		rawArgs := item.args[2:]
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					e.slots[n] = fmt.Sprintf("%v", r)
+				}
+			}()
+			e.invoke(fn, rawArgs)
+		}()
 	case open: // 14 — slot[n] = JSON.parse(slot[m])
 		if len(item.args) < 2 {
 			return
@@ -372,7 +389,7 @@ func (e *engine) dispatch(item tokenItem) {
 		n := toInt(item.args[0])
 		e.slots[n] = base64.StdEncoding.EncodeToString([]byte(toString(e.slots[n])))
 
-	case opfn: // 20 — m === n ? r(...o) : null
+	case opfn: // 20 — m === n ? invoke(r, ...o) : null
 		if len(item.args) < 3 {
 			return
 		}
@@ -382,15 +399,19 @@ func (e *engine) dispatch(item tokenItem) {
 			return
 		}
 		fnSlot := toInt(item.args[2])
-		if fn, ok := e.slots[fnSlot].(string); ok {
-			args := make([]any, len(item.args)-3)
-			for i, a := range item.args[3:] {
-				args[i] = toString(e.slots[toInt(a)])
-			}
-			e.nativeCall(fn, args)
-		}
+		e.invoke(e.slots[fnSlot], item.args[3:])
 
-	case opln: // 21 — abs(a-b) > c ? r(...args) : null (NOP in practice)
+	case opln: // 21 — abs(slot[n]-slot[e]) > slot[r] ? invoke(slot[o], ...c) : null
+		if len(item.args) < 4 {
+			return
+		}
+		a := toFloat64(e.slots[toInt(item.args[0])])
+		b := toFloat64(e.slots[toInt(item.args[1])])
+		threshold := toFloat64(e.slots[toInt(item.args[2])])
+		if math.Abs(a-b) > threshold {
+			fnSlot := toInt(item.args[3])
+			e.invoke(e.slots[fnSlot], item.args[4:])
+		}
 	case opdn: // 22 — 闭包作用域: save Qt → push args → run → restore Qt
 		if len(item.args) < 2 {
 			return
@@ -408,7 +429,7 @@ func (e *engine) dispatch(item tokenItem) {
 		e.queue = saved
 		_ = n // n 在某些用法中存储结果,但主要靠副作用
 
-	case opan: // 23 — undefined !== n ? m(...args) : null
+	case opan: // 23 — undefined !== n ? invoke(m, ...args) : null
 		if len(item.args) < 2 {
 			return
 		}
@@ -417,13 +438,7 @@ func (e *engine) dispatch(item tokenItem) {
 			return
 		}
 		m := toInt(item.args[1])
-		if fn, ok := e.slots[m].(string); ok {
-			args := make([]any, len(item.args)-2)
-			for i, a := range item.args[2:] {
-				args[i] = toString(e.slots[toInt(a)])
-			}
-			e.nativeCall(fn, args)
-		}
+		e.invoke(e.slots[m], item.args[2:])
 
 	case opVt: // 24 — slot[n] = slot[m][slot[r]].bind(slot[m])
 		if len(item.args) < 3 {
@@ -439,15 +454,21 @@ func (e *engine) dispatch(item tokenItem) {
 
 	case ophn, opin, opwn: // 25, 26, 28 — NOP
 
-	case opmn: // 27 — splice(0,1) 或数值减
+	case opmn: // 27 — splice(findIndex(e),1) 或数值减
 		if len(item.args) < 2 {
 			return
 		}
 		n := toInt(item.args[0])
 		m := toInt(item.args[1])
-		if arr, ok := e.slots[n].([]any); ok && len(arr) > 0 {
-			e.slots[n] = arr[1:]
-			e.slots[m] = arr[0]
+		if arr, ok := e.slots[n].([]any); ok {
+			target := e.slots[m]
+			for i, v := range arr {
+				if fmt.Sprintf("%v", v) == fmt.Sprintf("%v", target) {
+					e.slots[m] = v
+					e.slots[n] = append(arr[:i], arr[i+1:]...)
+					break
+				}
+			}
 		} else {
 			a := toFloat64(e.slots[n])
 			b := toFloat64(e.slots[m])
@@ -463,17 +484,38 @@ func (e *engine) dispatch(item tokenItem) {
 		r := toInt(item.args[2])
 		e.slots[n] = toString(e.slots[m]) < toString(e.slots[r])
 
-	case opgn: // 30 — 可重入 push
+	case opgn: // 30 — 创建闭包函数（可重入 push）
 		if len(item.args) < 2 {
 			return
 		}
 		n := toInt(item.args[0])
-		m := toInt(item.args[1])
-		cur := e.slots[n]
-		if arr, ok := cur.([]any); ok {
-			e.slots[n] = append(arr, e.slots[m])
+		hasR := len(item.args) >= 3
+		var paramSlots []int
+		var bodySlots []int
+		if hasR {
+			rArg := item.args[2]
+			if _, ok := rArg.([]any); ok {
+				// 参数化闭包: paramSlots = m, bodySlots = r
+				paramSlots = toSlotList(item.args[1])
+				bodySlots = toSlotList(item.args[2])
+			} else {
+				// 普通闭包: bodySlots = m, r 被忽略
+				bodySlots = toSlotList(item.args[1])
+			}
 		} else {
-			e.slots[n] = []any{cur, e.slots[m]}
+			bodySlots = toSlotList(item.args[1])
+		}
+		// 从槽位构建闭包 body（opcode 列表）
+		var body []tokenItem
+		for _, s := range bodySlots {
+			if sub, ok := e.slots[s].([]tokenItem); ok {
+				body = append(body, sub...)
+			}
+		}
+		e.slots[n] = &closureFunc{
+			paramSlots: paramSlots,
+			bodySlots:  bodySlots,
+			body:       body,
 		}
 
 	case op31, op32: // 31, 32 — NOP
@@ -493,17 +535,124 @@ func (e *engine) dispatch(item tokenItem) {
 		m := toInt(item.args[1])
 		e.slots[n] = e.slots[m]
 
-	case opkn: // 35 — slot[n] = Number(m) / Number(r) (除零保护)
+	case opkn: // 35 — slot[n] = Number(m) / Number(r)（除零返回 0）
 		if len(item.args) < 3 {
 			return
 		}
 		n := toInt(item.args[0])
 		divisor := toFloat64(e.slots[toInt(item.args[2])])
 		if divisor == 0 {
-			e.slots[n] = math.NaN()
+			e.slots[n] = 0.0
 		} else {
 			e.slots[n] = toFloat64(e.slots[toInt(item.args[1])]) / divisor
 		}
+	}
+}
+
+// ── property resolution & unified invoke ────────────────────────────────────
+
+// resolveProperty 实现 opcode 6 的真实属性访问 slot[m][slot[r]]。
+// SDK: Cn.get(e)[Cn.get(r)]
+func resolveProperty(parent any, key string) any {
+	switch p := parent.(type) {
+	case *orderedMap:
+		if v, ok := p.values[key]; ok {
+			return v
+		}
+		return nil
+	case map[string]any:
+		return p[key]
+	case string:
+		// 已知 window 子对象
+		known := map[string]string{
+			"window":     "window",
+			"self":       "window",
+			"document":   "window.document",
+			"navigator":  "window.navigator",
+			"location":   "https://chatgpt.com/",
+			"performance": "window.performance",
+			"screen":     "window.screen",
+			"Math":       "window.Math",
+			"Reflect":    "window.Reflect",
+			"Object":     "window.Object",
+			"localStorage":  "window.localStorage",
+			"sessionStorage": "window.sessionStorage",
+		}
+		fullKey := p + "." + key
+		if p == "window" || p == "window.document" || p == "window.navigator" || p == "window.screen" {
+			if v, ok := known[key]; ok {
+				return v
+			}
+			return fullKey
+		}
+		return fullKey
+	default:
+		return nil
+	}
+}
+
+// invoke 统一调度：字符串 → nativeCall，闭包 → 执行闭包队列。
+// rawArgs 是 JSON 原始 args（含槽位引用和字面量）。
+func (e *engine) invoke(fn any, rawArgs []any) {
+	switch f := fn.(type) {
+	case string:
+		// 解析槽位引用：数字 → 槽位值，其余 → 字面量
+		resolved := make([]any, len(rawArgs))
+		for i, a := range rawArgs {
+			if isSlotRef(a) {
+				resolved[i] = e.slots[toInt(a)]
+			} else {
+				resolved[i] = a
+			}
+		}
+		e.nativeCall(f, resolved)
+	case *closureFunc:
+		// 保存队列 → 绑定形参 → 推入 body → 执行 → 恢复
+		saved := e.queue
+		// 绑定形参：把调用时的 args 存入 paramSlots
+		for i, ps := range f.paramSlots {
+			if i < len(rawArgs) {
+				if isSlotRef(rawArgs[i]) {
+					e.slots[ps] = e.slots[toInt(rawArgs[i])]
+				} else {
+					e.slots[ps] = rawArgs[i]
+				}
+			}
+		}
+		e.queue = append([]tokenItem{}, f.body...)
+		e.runQueue()
+		e.queue = saved
+	}
+}
+
+// isSlotRef 判断一个 JSON arg 是否是槽位引用（数字类型）。
+func isSlotRef(a any) bool {
+	switch a.(type) {
+	case float64, int, json.Number:
+		return true
+	}
+	return false
+}
+
+// toSlotList 将一个 JSON arg 转为槽位索引列表。
+// 单个数字 → [int]；数组 → 展开为 []int。
+func toSlotList(a any) []int {
+	switch v := a.(type) {
+	case float64:
+		return []int{int(v)}
+	case int:
+		return []int{v}
+	case json.Number:
+		f, _ := v.Float64()
+		return []int{int(f)}
+	case []any:
+		result := make([]int, 0, len(v))
+		for _, item := range v {
+			result = append(result, toInt(item))
+		}
+		return result
+	default:
+		return nil
 	}
 }
 

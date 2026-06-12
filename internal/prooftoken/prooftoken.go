@@ -3,131 +3,115 @@ package prooftoken
 import (
 	"bytes"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math/rand"
-	"strconv"
 	"time"
 
 	"aurora/internal/turnstile"
-
-	"golang.org/x/crypto/sha3"
 )
 
 const (
 	powPrefixRequirements = "gAAAAAC"
 	powPrefixProof        = "gAAAAAB"
 
-	requirementsDifficulty = "0fffff"
-
-	maxRequirementsIter = 500_000
-	maxProofIter        = 100_000
-
 	powFallback = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D"
+
+	maxProofIter = 500_000
+
+	tokenSuffix = "~S"
 )
 
 var (
 	powCores   = []int{8, 16, 24, 32}
 	powScreens = []int{3000, 4000, 5000}
 
+	// config[10] 候选：navigator 原型方法的 toString 表征
 	powNavKeys = []string{
-		"registerProtocolHandler−function registerProtocolHandler() { [native code] }",
-		"storage−[object StorageManager]",
-		"locks−[object LockManager]",
-		"appCodeName−Mozilla",
-		"permissions−[object Permissions]",
-		"share−function share() { [native code] }",
-		"webdriver−false",
-		"managed−[object NavigatorManagedData]",
-		"canShare−function canShare() { [native code] }",
-		"vendor−Google Inc.",
-		"mediaDevices−[object MediaDevices]",
-		"vibrate−function vibrate() { [native code] }",
-		"storageBuckets−[object StorageBucketManager]",
-		"mediaCapabilities−[object MediaCapabilities]",
-		"cookieEnabled−true",
-		"virtualKeyboard−[object VirtualKeyboard]",
-		"product−Gecko",
-		"presentation−[object Presentation]",
-		"onLine−true",
-		"mimeTypes−[object MimeTypeArray]",
-		"credentials−[object CredentialsContainer]",
-		"serviceWorker−[object ServiceWorkerContainer]",
-		"keyboard−[object Keyboard]",
-		"gpu−[object GPU]",
-		"doNotTrack",
-		"serial−[object Serial]",
-		"pdfViewerEnabled−true",
-		"language−zh-CN",
-		"geolocation−[object Geolocation]",
-		"userAgentData−[object NavigatorUAData]",
-		"getUserMedia−function getUserMedia() { [native code] }",
+		"clearOriginJoinedAdInterestGroups−function clearOriginJoinedAdInterestGroups() { [native code] }",
+		"canLoadAdAuctionFencedFrame−function canLoadAdAuctionFencedFrame() { [native code] }",
+		"clipboard−[object Clipboard]",
+		"getBattery−function getBattery() { [native code] }",
+		"getGamepads−function getGamepads() { [native code] }",
+		"javaEnabled−function javaEnabled() { [native code] }",
 		"sendBeacon−function sendBeacon() { [native code] }",
-		"hardwareConcurrency−32",
-		"windowControlsOverlay−[object WindowControlsOverlay]",
-	}
-	powWinKeys = []string{
-		"0", "window", "self", "document", "name", "location",
-		"customElements", "history", "navigation",
-		"innerWidth", "innerHeight", "scrollX", "scrollY",
-		"visualViewport", "screenX", "screenY",
-		"outerWidth", "outerHeight", "devicePixelRatio",
-		"screen", "chrome", "navigator",
-		"onresize", "performance", "crypto",
-		"indexedDB", "sessionStorage", "localStorage", "scheduler",
-		"alert", "atob", "btoa", "fetch", "matchMedia",
-		"postMessage", "queueMicrotask", "requestAnimationFrame",
-		"setInterval", "setTimeout", "caches",
-		"__NEXT_DATA__", "__BUILD_MANIFEST", "__NEXT_PRELOADREADY",
+		"vibrate−function vibrate() { [native code] }",
 	}
 
-	powDocKeys = []string{"_reactListeningo743lnnpvdg", "location"}
+	// config[12] 候选：window 随机 key
+	powWinKeys = []string{
+		"requestIdleCallback", "webkitRequestAnimationFrame", "onfocus", "onblur",
+	}
 
 	defaultScriptSources = []string{"https://chatgpt.com/backend-api/sentinel/sdk.js"}
 )
 
-// POWConfig 是 18 元素的客户端指纹数组(requirements_token 用)。
-type POWConfig struct {
-	userAgent string
-	arr       [18]interface{}
-}
-
-func NewPOWConfig(userAgent string, scriptSources []string, dataBuild string) *POWConfig {
+// generateFingerprint 生成 25 元素浏览器指纹数组。
+// attempt/elapsedMs 为 nil 时填充 Math.random()（requirements_token 模式）；
+// 非 nil 时填入 PoW nonce 和耗时（proof_token 模式）。
+func generateFingerprint(
+	userAgent string,
+	scriptSources []string,
+	deviceID string,
+	attempt *int,
+	elapsedMs *float64,
+) []interface{} {
 	if userAgent == "" {
 		userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0"
 	}
 	if len(scriptSources) == 0 {
 		scriptSources = defaultScriptSources
 	}
-	//nolint:gosec // 非加密用途
+	//nolint:gosec
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	perfNow := float64(time.Now().UnixNano()) / 1e6 // performance.now() 等价
-	timeStr := _legacyParseTime()
-	scriptSrc := scriptSources[rng.Intn(len(scriptSources))]
 
-	c := &POWConfig{userAgent: userAgent}
-	c.arr = [18]interface{}{
-		powScreens[rng.Intn(len(powScreens))], // 0 — screen value
-		timeStr,                               // 1
-		4294705152,                            // 2 — 硬编码常量
-		0,                                     // 3 — 迭代会覆盖
-		userAgent,                             // 4
-		scriptSrc,                             // 5 — <script src> 或默认 sdk.js
-		dataBuild,                             // 6 — data-build 属性或 c/.../_ 匹配
-		"en-US",                               // 7
-		"en-US,es-US,en,es",                   // 8
-		0,                                     // 9 — 迭代会覆盖
-		powNavKeys[rng.Intn(len(powNavKeys))], // 10
-		powDocKeys[rng.Intn(len(powDocKeys))], // 11
-		powWinKeys[rng.Intn(len(powWinKeys))], // 12
-		perfNow,                               // 13 — perf_counter()*1000
-		randomUUID(rng),                       // 14
-		"",                                    // 15
-		powCores[rng.Intn(len(powCores))],     // 16
-		float64(time.Now().UnixMilli()) - perfNow, // 17 — timeOrigin
+	nowMs := float64(time.Now().UnixMilli())
+	perfNow := float64(int64(rng.Float64()*49000)+1000) + rng.Float64() // [1000, 50000)
+	timeOrigin := nowMs - perfNow
+
+	scriptSrc := scriptSources[rng.Intn(len(scriptSources))]
+	screenW := powScreens[rng.Intn(len(powScreens))]
+
+	var c3, c9 interface{}
+	if attempt != nil {
+		c3 = *attempt
+	} else {
+		c3 = rng.Float64()
 	}
-	return c
+	if elapsedMs != nil {
+		c9 = int(*elapsedMs)
+	} else {
+		c9 = rng.Float64()
+	}
+
+	// _reactListening + 11 位随机小写字母数字
+	const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
+	reactSuffix := make([]byte, 11)
+	for i := range reactSuffix {
+		reactSuffix[i] = letters[rng.Intn(len(letters))]
+	}
+
+	return []interface{}{
+		screenW + screenW/2,                       // [0]  screen.width + screen.height
+		_legacyParseTime(),                        // [1]  Date.prototype.toString()
+		4294967296,                                // [2]  jsHeapSizeLimit (Chrome 4GB)
+		c3,                                        // [3]  Math.random() / PoW nonce
+		userAgent,                                 // [4]  navigator.userAgent
+		scriptSrc,                                 // [5]  currentScript.src
+		nil,                                       // [6]  documentElement[data-build]
+		"zh-CN",                                   // [7]  navigator.language
+		"zh-CN,en,en-GB,en-US",                    // [8]  navigator.languages.join(",")
+		c9,                                        // [9]  Math.random() / PoW 耗时 ms
+		powNavKeys[rng.Intn(len(powNavKeys))],     // [10] 随机 navigator 原型方法
+		"_reactListening" + string(reactSuffix),   // [11] document 随机 key
+		powWinKeys[rng.Intn(len(powWinKeys))],     // [12] window 随机 key
+		perfNow,                                   // [13] performance.now()
+		deviceID,                                  // [14] sid / device_id
+		"",                                        // [15] location.search
+		powCores[rng.Intn(len(powCores))],         // [16] hardwareConcurrency
+		timeOrigin,                                // [17] performance.timeOrigin
+		0, 0, 0, 0, 0, 0, 0,                      // [18-24] "X in window" 检查（全部 0）
+	}
 }
 
 func _legacyParseTime() string {
@@ -135,148 +119,80 @@ func _legacyParseTime() string {
 	return time.Now().In(loc).Format("Mon Jan 02 2006 15:04:05") + " GMT-0500 (Eastern Standard Time)"
 }
 
-func (c *POWConfig) RequirementsToken() string {
-	//nolint:gosec
-	seed := strconv.FormatFloat(rand.Float64(), 'f', -1, 64)
-	b64, ok := c.solveRequirements(seed, requirementsDifficulty)
-	if !ok {
-		return powPrefixRequirements + powFallback +
-			base64.StdEncoding.EncodeToString([]byte(`"`+seed+`"`))
-	}
-	return powPrefixRequirements + b64
+// encodeConfig 将 config 数组编码为 base64 字符串（对齐 SDK 的 N() 函数）。
+func encodeConfig(config []interface{}) string {
+	raw := marshalCompact(config)
+	return base64.StdEncoding.EncodeToString(raw)
 }
 
-func (c *POWConfig) solveRequirements(seed, difficulty string) (string, bool) {
-	target, err := hex.DecodeString(difficulty)
-	if err != nil {
-		return "", false
+// ── FNV-1a 哈希（对齐 SDK 哈希函数）─────────────────────────────────────────
+
+func fnv1aHash(text string) uint32 {
+	h := uint32(2166136261)
+	for i := 0; i < len(text); i++ {
+		h ^= uint32(text[i])
+		h = imul(h, 16777619)
 	}
-	diffLen := len(difficulty) / 2 // hex 字符数
-
-	// 预拼 p1/p2/p3。config[3] 和 config[9] 位置留给迭代器。
-	arr := c.arr
-	// p1 = compact_json(arr[:3])[:-1] + ","
-	head := marshalCompact([]interface{}{arr[0], arr[1], arr[2]})
-	p1 := append(head[:len(head)-1:len(head)-1], ',')
-
-	// p2 = "," + compact_json(arr[4:9])[1:-1] + ","
-	mid := marshalCompact([]interface{}{arr[4], arr[5], arr[6], arr[7], arr[8]})
-	p2 := make([]byte, 0, len(mid)+2)
-	p2 = append(p2, ',')
-	p2 = append(p2, mid[1:len(mid)-1]...)
-	p2 = append(p2, ',')
-
-	// p3 = "," + compact_json(arr[10:])[1:]
-	tail := marshalCompact([]interface{}{
-		arr[10], arr[11], arr[12], arr[13], arr[14], arr[15], arr[16], arr[17],
-	})
-	p3 := make([]byte, 0, len(tail)+1)
-	p3 = append(p3, ',')
-	p3 = append(p3, tail[1:]...)
-
-	hasher := sha3.New512()
-	seedB := []byte(seed)
-	buf := make([]byte, 0, len(p1)+32+len(p2)+16+len(p3))
-	b64buf := make([]byte, base64.StdEncoding.EncodedLen(cap(buf)))
-
-	for i := 0; i < maxRequirementsIter; i++ {
-		d1 := strconv.Itoa(i)
-		d2 := strconv.Itoa(i >> 1)
-
-		buf = buf[:0]
-		buf = append(buf, p1...)
-		buf = append(buf, d1...)
-		buf = append(buf, p2...)
-		buf = append(buf, d2...)
-		buf = append(buf, p3...)
-
-		n := base64.StdEncoding.EncodedLen(len(buf))
-		if cap(b64buf) < n {
-			b64buf = make([]byte, n)
-		}
-		b64buf = b64buf[:n]
-		base64.StdEncoding.Encode(b64buf, buf)
-
-		hasher.Reset()
-		hasher.Write(seedB)
-		hasher.Write(b64buf)
-		sum := hasher.Sum(nil)
-
-		if bytes.Compare(sum[:diffLen], target) <= 0 {
-			return string(b64buf), true
-		}
-	}
-	return "", false
+	h ^= h >> 16
+	h = imul(h, 2246822507)
+	h ^= h >> 13
+	h = imul(h, 3266489909)
+	h ^= h >> 16
+	return h
 }
 
-func SolveProofToken(seed, difficulty, userAgent string, scriptSources []string, dataBuild string) string {
+func imul(a, b uint32) uint32 {
+	return a * b // Go uint32 乘法自动截断，等价于 JS Math.imul
+}
+
+func fnv1aHex(text string) string {
+	return fmt.Sprintf("%08x", fnv1aHash(text))
+}
+
+// ── Requirements Token（无 PoW）─────────────────────────────────────────────
+
+// RequirementsToken 生成 requirements token。
+// 对齐 sentinel.py: generate_requirements_token = "gAAAAAC" + encode(config) + "~S"
+func RequirementsToken(userAgent string, scriptSources []string, deviceID string) string {
+	config := generateFingerprint(userAgent, scriptSources, deviceID, nil, nil)
+	return powPrefixRequirements + encodeConfig(config) + tokenSuffix
+}
+
+// ── Proof Token（FNV-1a PoW）────────────────────────────────────────────────
+
+// SolveProofToken 计算 Proof of Work token。
+// 对齐 sentinel.py: solve_proof_of_work，哈希用 FNV-1a，返回 "gAAAAAB" + encoded + "~S"。
+func SolveProofToken(seed, difficulty, userAgent string, scriptSources []string, deviceID string) string {
 	if seed == "" || difficulty == "" {
 		return ""
 	}
-	if userAgent == "" {
-		userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0"
-	}
-	if len(scriptSources) == 0 {
-		scriptSources = defaultScriptSources
-	}
-	//nolint:gosec
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	screen := powScreens[rng.Intn(len(powScreens))]
 
-	timeStr := _legacyParseTime()
-	scriptSrc := scriptSources[rng.Intn(len(scriptSources))]
+	startTime := float64(time.Now().UnixMilli())
+	attempt := 0
+	elapsed := 0.0
+	config := generateFingerprint(userAgent, scriptSources, deviceID, &attempt, &elapsed)
 
-	proofConfig := []interface{}{
-		screen,                                // 0
-		timeStr,                               // 1
-		4294705152,                            // 2
-		0,                                     // 3 — 迭代
-		userAgent,                             // 4
-		scriptSrc,                             // 5
-		dataBuild,                             // 6
-		"en-US",                               // 7
-		"en-US,es-US,en,es",                   // 8
-		0,                                     // 9
-		powNavKeys[rng.Intn(len(powNavKeys))], // 10
-		powDocKeys[rng.Intn(len(powDocKeys))], // 11
-		powWinKeys[rng.Intn(len(powWinKeys))], // 12
-		float64(time.Now().UnixNano()) / 1e6,  // 13 — perf_counter()*1000
-		randomUUID(rng),                       // 14
-		"",                                    // 15
-		powCores[rng.Intn(len(powCores))],     // 16
-		float64(time.Now().UnixMilli()) - float64(time.Now().UnixNano())/1e6, // 17
-	}
+	timeOrigin := config[17].(float64)
+	diffLen := len(difficulty)
 
-	diffLen := len(difficulty) / 2
-	//nolint:gosec
-	target, _ := hex.DecodeString(difficulty)
-	seedB := []byte(seed)
-	hasher := sha3.New512()
 	for i := 0; i < maxProofIter; i++ {
-		proofConfig[3] = i
-		proofConfig[9] = i >> 1
-		raw := marshalCompact(proofConfig)
-		b64 := base64.StdEncoding.EncodeToString(raw)
-		hasher.Reset()
-		hasher.Write(seedB)
-		hasher.Write([]byte(b64))
-		sum := hasher.Sum(nil)
-		if bytes.Compare(sum[:diffLen], target) <= 0 {
-			return powPrefixProof + b64
+		elapsedNow := float64(time.Now().UnixMilli()) - startTime
+		config[3] = i
+		config[9] = int(elapsedNow)
+		config[13] = timeOrigin - startTime + elapsedNow // performance.now() 与 timeOrigin 自洽
+
+		encoded := encodeConfig(config)
+		hashResult := fnv1aHex(seed + encoded)
+
+		if hashResult[:diffLen] <= difficulty {
+			return powPrefixProof + encoded + tokenSuffix
 		}
 	}
-	return powPrefixProof + powFallback +
-		base64.StdEncoding.EncodeToString([]byte(`"`+seed+`"`))
+
+	return powPrefixProof + powFallback + encodeConfig([]interface{}{"e"})
 }
 
-func randomUUID(rng *rand.Rand) string {
-	var b [16]byte
-	_, _ = rng.Read(b[:])
-	b[6] = (b[6] & 0x0f) | 0x40
-	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
-}
+// ── helpers ─────────────────────────────────────────────────────────────────
 
 func marshalCompact(v interface{}) []byte {
 	b, _ := json.Marshal(v)
